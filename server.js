@@ -2,6 +2,7 @@
  * 代理服务器实现：
  * - 所有请求发至 /proxy 后会被依次排队，只有上一个请求完成后才会处理下一个请求
  * - 非流式版本：整个响应数据获取完成后，再返回给客户端
+ * - 对请求头和请求体进行过滤，仅保留目标 API 所需的部分字段
  */
 const express = require('express');
 const axios = require('axios');
@@ -12,6 +13,9 @@ app.use(express.json());
 
 // 大模型 API 地址，可通过环境变量 MODEL_API_ENDPOINT 进行配置
 const MODEL_API_ENDPOINT = process.env.MODEL_API_ENDPOINT || 'https://chat01.ai/v1/chat/completions';
+
+// 允许转发的请求头列表
+const allowedHeaders = ['content-type', 'accept', 'authorization'];
 
 // 请求队列及处理标记
 let queue = [];
@@ -31,15 +35,30 @@ function processQueue() {
   console.log(`\n========== 开始处理请求 ==========\n当前队列长度：${queue.length}`);
   console.log(`转发请求到大模型 API：${MODEL_API_ENDPOINT}`);
   console.log(`请求方法：${req.method}`);
-  console.log('请求头：', req.headers);
-  console.log('请求体：', req.body);
+
+  // 过滤请求头，仅保留允许的字段
+  const filteredHeaders = {};
+  Object.keys(req.headers).forEach(key => {
+    if (allowedHeaders.includes(key.toLowerCase())) {
+      filteredHeaders[key] = req.headers[key];
+    }
+  });
+  console.log('过滤后的请求头：', filteredHeaders);
+
+  // 过滤请求体，移除不需要的字段，例如 stream
+  const forwardBody = { ...req.body };
+  if ('stream' in forwardBody) {
+    console.log('检测到请求体中存在 "stream" 参数，已将其移除');
+    delete forwardBody.stream;
+  }
+  console.log('转发的请求体：', forwardBody);
 
   axios({
     method: req.method,
     url: MODEL_API_ENDPOINT,
-    data: req.body,
+    data: forwardBody,
     // 非流式模式，使用默认的响应处理方式（缓冲完整响应）
-    headers: req.headers
+    headers: filteredHeaders
   }).then(apiRes => {
     console.log(`\n从大模型 API 收到响应，状态码：${apiRes.status}`);
     console.log('响应头：', apiRes.headers);
