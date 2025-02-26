@@ -1,8 +1,10 @@
 /**
  * 代理服务器实现：
  * - 所有请求发至 /proxy 后会被依次排队，只有上一个请求完成后才会处理下一个请求
- * - 非流式版本：整个响应数据获取完成后，再返回给客户端
- * - 对请求头和请求体进行过滤，仅保留目标 API 所需的部分字段
+ * - 根据请求体中的 "stream" 参数决定是否启用流式转发：
+ *    - 如果 "stream" 为 true，则删除该参数并启用流式转发，将大模型 API 的响应实时转发给客户端；
+ *    - 否则以非流式方式返回完整响应。
+ * - 每个请求在实际转发前至少等待2秒，并在等待期间每隔5秒向客户端发送一次提示信息
  */
 const express = require('express');
 const axios = require('axios');
@@ -45,46 +47,96 @@ function processQueue() {
   });
   console.log('过滤后的请求头：', filteredHeaders);
 
-  // 过滤请求体，移除不需要的字段，例如 stream
+  // 根据请求体中的 stream 参数判断是否启用流式转发
+  let useStream = false;
   const forwardBody = { ...req.body };
-  if ('stream' in forwardBody) {
-    console.log('检测到请求体中存在 "stream" 参数，已将其移除');
-    delete forwardBody.stream;
+  if (forwardBody.stream === true) {
+    useStream = true;
   }
   console.log('转发的请求体：', forwardBody);
-
-  axios({
-  method: req.method,
-  url: MODEL_API_ENDPOINT,
-  data: forwardBody,
-  headers: filteredHeaders
-}).then(apiRes => {
-  console.log(`\n从大模型 API 收到响应，状态码：${apiRes.status}`);
-  console.log('响应头：', apiRes.headers);
-  console.log('响应数据：', apiRes.data);
   
-  // 将 AxiosHeaders 转为普通对象
-  let responseHeaders = { ...apiRes.headers };
-  // 删除可能冲突的头信息
-  delete responseHeaders['transfer-encoding'];
-  delete responseHeaders['content-length'];
+  // 设置响应头，启用分块传输（便于发送等待提示）
+  // 注意：为了兼容流式与非流式两种情况，这里先统一设置为 text/plain
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
 
-  // 发送响应数据给客户端
-  res.status(apiRes.status).set(responseHeaders).send(apiRes.data);
-  console.log('响应数据已发送给客户端。');
-  processQueue();
-}).catch(err => {
-  console.error('\n转发请求时发生错误：', err.toString());
-  if (err.response) {
-    console.error('错误响应状态码：', err.response.status);
-    console.error('错误响应头：', err.response.headers);
-    console.error('错误响应数据：', err.response.data);
-    res.status(err.response.status || 500).send(err.response.data);
-  } else {
-    res.status(500).send(err.toString());
-  }
-  processQueue();
-});
+  // 启动等待提示定时器：每隔5秒发送一次提示信息
+  const waitingInterval = setInterval(() => {
+    console.log('发送排队中提示给客户端');
+    res.write("排队中，请稍后的信息\n");
+  }, 5000);
+
+  // 至少等待2秒后再开始转发请求
+  setTimeout(() => {
+    // 清除等待提示
+    clearInterval(waitingInterval);
+    res.write("\n--- 开始返回数据 ---\n");
+
+    if (useStream) {
+      // 启用流式转发
+      axios({
+        method: req.method,
+        url: MODEL_API_ENDPOINT,
+        data: forwardBody,
+        responseType: 'stream',
+        headers: filteredHeaders
+      }).then(apiRes => {
+        console.log(`\n[流式] 从大模型 API 收到响应，状态码：${apiRes.status}`);
+        console.log('开始将 API 响应流式转发给客户端...');
+        // 将 API 的响应流直接 pipe 到客户端
+        apiRes.data.pipe(res);
+        // 当 API 响应流结束时，结束响应并处理下一个请求
+        apiRes.data.on('end', () => {
+          console.log("API响应流结束");
+          res.end();
+          processQueue();
+        });
+        apiRes.data.on('error', (err) => {
+          console.error("API响应流错误：", err);
+          res.write("\nAPI响应流发生错误\n");
+          res.end();
+          processQueue();
+        });
+      }).catch(err => {
+        console.error("\n转发请求时发生错误：", err.toString());
+        if (err.response) {
+          console.error('错误响应状态码：', err.response.status);
+          console.error('错误响应数据：', err.response.data);
+          res.write("转发请求时发生错误：" + err.response.data);
+        } else {
+          res.write("转发请求时发生错误：" + err.toString());
+        }
+        res.end();
+        processQueue();
+      });
+    } else {
+      // 非流式方式：一次性获取完整响应
+      axios({
+        method: req.method,
+        url: MODEL_API_ENDPOINT,
+        data: forwardBody,
+        headers: filteredHeaders
+      }).then(apiRes => {
+        console.log(`\n[非流式] 从大模型 API 收到响应，状态码：${apiRes.status}`);
+        console.log('响应数据：', apiRes.data);
+        // 将完整响应数据转换为 JSON 字符串后发送给客户端
+        res.write(JSON.stringify(apiRes.data, null, 2));
+        res.end();
+        console.log('响应数据已发送给客户端。');
+        processQueue();
+      }).catch(err => {
+        console.error("\n转发请求时发生错误：", err.toString());
+        if (err.response) {
+          console.error('错误响应状态码：', err.response.status);
+          console.error('错误响应数据：', err.response.data);
+          res.write("转发请求时发生错误：" + JSON.stringify(err.response.data));
+        } else {
+          res.write("转发请求时发生错误：" + err.toString());
+        }
+        res.end();
+        processQueue();
+      });
+    }
+  }, 2000);
 }
 
 // 所有 /proxy 路由的请求都加入队列处理
