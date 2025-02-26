@@ -2,9 +2,10 @@
  * 代理服务器实现：
  * - 所有请求发至 /proxy 后会被依次排队，只有上一个请求完成后才会处理下一个请求
  * - 根据请求体中的 "stream" 参数决定是否启用流式转发：
- *    - 如果 "stream" 为 true，则删除该参数并启用流式转发，将大模型 API 的响应实时转发给客户端；
- *    - 否则以非流式方式返回完整响应。
- * - 每个请求在实际转发前至少等待2秒，并在等待期间每隔5秒向客户端发送一次提示信息
+ *    - 如果 "stream" 为 true，则（删除该参数）使用流式方式获取并转发 API 响应
+ *    - 否则使用非流式方式，一次性获取完整响应后再发送给客户端
+ * - 无论流式与否，都在请求正式发出前至少等待2秒，并在等待期间每隔5秒以文本流方式向客户端输出排队提示
+ * - 整个响应都以 text/plain 进行输出，避免混合排队提示与 JSON 导致的解析错误
  */
 const express = require('express');
 const axios = require('axios');
@@ -53,88 +54,98 @@ function processQueue() {
   if (forwardBody.stream === true) {
     useStream = true;
   }
+  if ('stream' in forwardBody) {
+    console.log('检测到请求体中存在 "stream" 参数，已将其移除');
+    delete forwardBody.stream;
+  }
   console.log('转发的请求体：', forwardBody);
   
-  // 设置响应头，启用分块传输（便于发送等待提示）
-  // 注意：为了兼容流式与非流式两种情况，这里先统一设置为 text/plain
+  // 设置响应头：text/plain (分块传输)，保证可以持续写入排队提示
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
 
-  // 启动等待提示定时器：每隔5秒发送一次提示信息
+  // 启动等待提示定时器：每隔5秒发送一次排队信息
   const waitingInterval = setInterval(() => {
     console.log('发送排队中提示给客户端');
-    res.write("排队中，请稍后的信息\n");
+    res.write("排队中，请稍后...\n");
   }, 5000);
 
-  // 至少等待2秒后再开始转发请求
+  // 至少等待2秒后再开始请求目标API
   setTimeout(() => {
-    // 清除等待提示
     clearInterval(waitingInterval);
     res.write("\n--- 开始返回数据 ---\n");
 
     if (useStream) {
-      // 启用流式转发
+      // 1) 流式请求处理
       axios({
         method: req.method,
         url: MODEL_API_ENDPOINT,
         data: forwardBody,
-        responseType: 'stream',
-        headers: filteredHeaders
-      }).then(apiRes => {
-        console.log(`\n[流式] 从大模型 API 收到响应，状态码：${apiRes.status}`);
-        console.log('开始将 API 响应流式转发给客户端...');
-        // 将 API 的响应流直接 pipe 到客户端
-        apiRes.data.pipe(res);
-        // 当 API 响应流结束时，结束响应并处理下一个请求
-        apiRes.data.on('end', () => {
-          console.log("API响应流结束");
+        headers: filteredHeaders,
+        responseType: 'stream'
+      })
+        .then(apiRes => {
+          console.log(`[流式] 收到大模型 API 响应，状态码：${apiRes.status}`);
+          // 将 API 响应流直接pipe给客户端
+          apiRes.data.pipe(res);
+          apiRes.data.on('end', () => {
+            console.log("API响应流结束");
+            res.end();
+            processQueue();
+          });
+          apiRes.data.on('error', err => {
+            console.error("API响应流出错：", err);
+            res.write("\nAPI响应流发生错误\n");
+            res.end();
+            processQueue();
+          });
+        })
+        .catch(err => {
+          console.error("转发请求时发生错误：", err.toString());
+          if (err.response) {
+            console.error('错误响应状态码：', err.response.status);
+            console.error('错误响应数据：', err.response.data);
+            res.write("转发请求时发生错误：" + JSON.stringify(err.response.data));
+          } else {
+            res.write("转发请求时发生错误：" + err.toString());
+          }
           res.end();
           processQueue();
         });
-        apiRes.data.on('error', (err) => {
-          console.error("API响应流错误：", err);
-          res.write("\nAPI响应流发生错误\n");
-          res.end();
-          processQueue();
-        });
-      }).catch(err => {
-        console.error("\n转发请求时发生错误：", err.toString());
-        if (err.response) {
-          console.error('错误响应状态码：', err.response.status);
-          console.error('错误响应数据：', err.response.data);
-          res.write("转发请求时发生错误：" + err.response.data);
-        } else {
-          res.write("转发请求时发生错误：" + err.toString());
-        }
-        res.end();
-        processQueue();
-      });
     } else {
-      // 非流式方式：一次性获取完整响应
+      // 2) 非流式请求处理
       axios({
         method: req.method,
         url: MODEL_API_ENDPOINT,
         data: forwardBody,
         headers: filteredHeaders
-      }).then(apiRes => {
-        console.log(`\n[非流式] 从大模型 API 收到响应，状态码：${apiRes.status}`);
-        console.log('响应数据：', apiRes.data);
-        // 将完整响应数据转换为 JSON 字符串后发送给客户端
-        res.write(JSON.stringify(apiRes.data, null, 2));
-        res.end();
-        console.log('响应数据已发送给客户端。');
-        processQueue();
-      }).catch(err => {
-        console.error("\n转发请求时发生错误：", err.toString());
-        if (err.response) {
-          console.error('错误响应状态码：', err.response.status);
-          console.error('错误响应数据：', err.response.data);
-          res.write("转发请求时发生错误：" + JSON.stringify(err.response.data));
-        } else {
-          res.write("转发请求时发生错误：" + err.toString());
-        }
-        res.end();
-        processQueue();
-      });
+      })
+        .then(apiRes => {
+          console.log(`[非流式] 收到大模型 API 响应，状态码：${apiRes.status}`);
+          let dataStr = '';
+          // 确保将响应转换为字符串（可能是对象或字符串）
+          if (typeof apiRes.data === 'object') {
+            dataStr = JSON.stringify(apiRes.data, null, 2);
+          } else {
+            dataStr = String(apiRes.data);
+          }
+          // 将结果写到客户端
+          res.write(dataStr);
+          res.end();
+          console.log('非流式响应数据已发送给客户端。');
+          processQueue();
+        })
+        .catch(err => {
+          console.error("转发请求时发生错误：", err.toString());
+          if (err.response) {
+            console.error('错误响应状态码：', err.response.status);
+            console.error('错误响应数据：', err.response.data);
+            res.write("转发请求时发生错误：" + JSON.stringify(err.response.data));
+          } else {
+            res.write("转发请求时发生错误：" + err.toString());
+          }
+          res.end();
+          processQueue();
+        });
     }
   }, 2000);
 }
