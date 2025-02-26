@@ -54,31 +54,37 @@ function processQueue() {
   console.log('转发的请求体：', forwardBody);
 
   axios({
-    method: req.method,
-    url: MODEL_API_ENDPOINT,
-    data: forwardBody,
-    // 非流式模式，使用默认的响应处理方式（缓冲完整响应）
-    headers: filteredHeaders
-  }).then(apiRes => {
-    console.log(`\n从大模型 API 收到响应，状态码：${apiRes.status}`);
-    console.log('响应头：', apiRes.headers);
-    console.log('响应数据：', apiRes.data);
-    // 将 API 的状态码和头信息传递给客户端，并发送完整响应数据
-    res.status(apiRes.status).set(apiRes.headers).send(apiRes.data);
-    console.log('响应数据已发送给客户端。');
-    processQueue();
-  }).catch(err => {
-    console.error('\n转发请求时发生错误：', err.toString());
-    if (err.response) {
-      console.error('错误响应状态码：', err.response.status);
-      console.error('错误响应头：', err.response.headers);
-      console.error('错误响应数据：', err.response.data);
-      res.status(err.response.status || 500).send(err.response.data);
-    } else {
-      res.status(500).send(err.toString());
-    }
-    processQueue();
-  });
+  method: req.method,
+  url: MODEL_API_ENDPOINT,
+  data: forwardBody,
+  headers: filteredHeaders
+}).then(apiRes => {
+  console.log(`\n从大模型 API 收到响应，状态码：${apiRes.status}`);
+  console.log('响应头：', apiRes.headers);
+  console.log('响应数据：', apiRes.data);
+  
+  // 将 AxiosHeaders 转为普通对象
+  let responseHeaders = { ...apiRes.headers };
+  // 删除可能冲突的头信息
+  delete responseHeaders['transfer-encoding'];
+  delete responseHeaders['content-length'];
+
+  // 发送响应数据给客户端
+  res.status(apiRes.status).set(responseHeaders).send(apiRes.data);
+  console.log('响应数据已发送给客户端。');
+  processQueue();
+}).catch(err => {
+  console.error('\n转发请求时发生错误：', err.toString());
+  if (err.response) {
+    console.error('错误响应状态码：', err.response.status);
+    console.error('错误响应头：', err.response.headers);
+    console.error('错误响应数据：', err.response.data);
+    res.status(err.response.status || 500).send(err.response.data);
+  } else {
+    res.status(500).send(err.toString());
+  }
+  processQueue();
+});
 }
 
 // 所有 /proxy 路由的请求都加入队列处理
